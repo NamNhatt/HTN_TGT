@@ -1,0 +1,119 @@
+import smbus2
+import time
+import RPi.GPIO as GPIO
+import threading
+import json
+from urllib import parse, request, error
+from seeed_dht import DHT
+import drivers
+
+# Thiết lập GPIO
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(20, GPIO.OUT)
+GPIO.setup(16, GPIO.OUT)
+
+# Thiết lập I2C và LCD
+bus = smbus2.SMBus(1)
+BH1750_ADDRESS = 0x23
+lcd = drivers.Lcd(addr=0x27)
+lcd.lcd_clear()
+
+# Cảm biến DHT
+dht = DHT('22', 21)
+CONTINUOUS_HIGH_RES_MODE = 0x10
+
+# Biến toàn cục
+humi, temp, light = 0, 0, 0
+mode = "auto"  # Chế độ mặc định là auto
+network_connected = True
+
+# Đọc dữ liệu từ ThingSpeak
+def thingspeak_get(field):
+    global network_connected
+    try:
+        api_key_read = "B1H8BKOFNI73462X"
+        channel_id = "2867681"
+        req = request.Request(f"https://api.thingspeak.com/channels/{channel_id}/fields/{field}/last.json?api_key={api_key_read}", method="GET")
+        r = request.urlopen(req)
+        response_data = json.loads(r.read().decode())
+        network_connected = True
+        return int(response_data[f'field{field}'])
+    except error.URLError:
+        print("Mất kết nối mạng, chuyển sang chế độ auto")
+        network_connected = False
+        return 1  # Khi mất kết nối, chuyển sang chế độ auto
+
+# Gửi dữ liệu lên ThingSpeak
+def thingspeak_post(data1, data2, data3):
+    global network_connected
+    try:
+        api_key_write = "OYHTDH1QAQSBC3R3"
+        params = parse.urlencode({'field1': data1, 'field2': data2, 'field3': data3}).encode()
+        req = request.Request('https://api.thingspeak.com/update', method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("X-THINGSPEAKAPIKEY", api_key_write)
+        request.urlopen(req, data=params)
+        network_connected = True
+    except error.URLError:
+        print("Mất kết nối mạng, không thể gửi dữ liệu")
+        network_connected = False
+
+# Đọc cảm biến ánh sáng
+def read_light():
+    data = bus.read_i2c_block_data(BH1750_ADDRESS, CONTINUOUS_HIGH_RES_MODE, 2)
+    return (data[0] << 8) | data[1]
+
+# Luồng đọc cảm biến
+def sensor_thread():
+    global humi, temp, light, mode, network_connected
+    while True:
+        humi, temp = dht.read()
+        light = read_light()
+        lcd.lcd_clear()
+        lcd.lcd_display_string(str(round(temp,2))+chr(223)+"C", 11)
+        lcd.lcd_display_string(" "+str(round(humi,2))+" %", 13)
+        lcd.lcd_display_string(str(light)+" lux", 21)
+        lcd.lcd_display_string(f" {mode}", 23)
+        time.sleep(2)
+
+# Luồng xử lý chế độ
+def mode_thread():
+    global mode
+    while True:
+        value3 = thingspeak_get(3)
+        mode = "auto" if value3 == 1 else "manual"
+        time.sleep(5)
+
+# Luồng điều khiển thiết bị
+def control_thread():
+    while True:
+        if mode == "auto":
+            if humi > 60 or temp > 32:
+                GPIO.output(20, GPIO.HIGH)
+            else:
+                GPIO.output(20, GPIO.LOW)
+            if light > 1000:
+                GPIO.output(16, GPIO.LOW)
+            else:
+                GPIO.output(16, GPIO.HIGH)
+            thingspeak_post(temp, humi, light)
+        else:
+            value1 = thingspeak_get(1)
+            value2 = thingspeak_get(2)
+            GPIO.output(20, GPIO.HIGH if value1 == 1 else GPIO.LOW)
+            GPIO.output(16, GPIO.HIGH if value2 == 1 else GPIO.LOW)
+        time.sleep(1)
+
+# Chạy các luồng
+if __name__ == "__main__":
+    try:
+        threading.Thread(target=sensor_thread, daemon=True).start()
+        threading.Thread(target=mode_thread, daemon=True).start()
+        threading.Thread(target=control_thread, daemon=True).start()
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Exiting...")
+        GPIO.cleanup()
+
